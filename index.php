@@ -103,6 +103,8 @@ function runYtDlpDownload($url, $outputTemplate, $isAudio) {
     $common = [
         escapeshellarg($binary),
         '--no-playlist',
+        '--playlist-items',
+        '1',
         '--no-warnings',
         '--restrict-filenames',
         '--output', escapeshellarg($outputTemplate),
@@ -113,10 +115,16 @@ function runYtDlpDownload($url, $outputTemplate, $isAudio) {
         $common[] = '--audio-format';
         $common[] = 'mp3';
     } else {
+        $ffmpegBinary = trim((string) shell_exec('command -v ffmpeg 2>/dev/null'));
+        $hasFfmpeg = $ffmpegBinary !== '';
+
         $common[] = '-f';
-        $common[] = escapeshellarg('bv*+ba/b');
-        $common[] = '--merge-output-format';
-        $common[] = 'mp4';
+        $common[] = escapeshellarg($hasFfmpeg ? 'bv*+ba/b' : 'b[ext=mp4]/best[ext=mp4]/best');
+
+        if ($hasFfmpeg) {
+            $common[] = '--merge-output-format';
+            $common[] = 'mp4';
+        }
     }
 
     $common[] = escapeshellarg($url);
@@ -140,9 +148,14 @@ function runYtDlpDownload($url, $outputTemplate, $isAudio) {
         ];
     }
 
+    $hint = '';
+    if (!$isAudio && trim((string) shell_exec('command -v ffmpeg 2>/dev/null')) === '') {
+        $hint = "\nHint: ffmpeg is missing on the server. Install it to enable best-quality video+audio merging.";
+    }
+
     return [
         'ok' => false,
-        'error' => trim((string) $output) ?: 'yt-dlp failed without output',
+        'error' => (trim((string) $output) ?: 'yt-dlp failed without output') . $hint,
     ];
 }
 
