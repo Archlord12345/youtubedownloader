@@ -3,6 +3,12 @@
 $action = $_GET['action'] ?? '';
 
 $downloadsFile = __DIR__ . '/downloads.json';
+$downloadsDir = __DIR__ . '/downloads';
+
+// Initialize local storage if it doesn't exist
+if (!is_dir($downloadsDir)) {
+    mkdir($downloadsDir, 0755, true);
+}
 
 // Initialize downloads file if it doesn't exist
 if (!file_exists($downloadsFile)) {
@@ -33,6 +39,137 @@ function saveDownload($videoInfo) {
         array_unshift($downloads, $videoInfo);
         file_put_contents($downloadsFile, json_encode($downloads, JSON_PRETTY_PRINT));
     }
+}
+
+
+function sanitizeFileName($name) {
+    $clean = preg_replace('/[^a-zA-Z0-9-_\. ]/', '', $name);
+    $clean = trim($clean);
+    return $clean !== '' ? $clean : 'video';
+}
+
+function guessExtensionFromContentType($contentType, $fallback = 'mp4') {
+    $map = [
+        'video/mp4' => 'mp4',
+        'video/webm' => 'webm',
+        'audio/mpeg' => 'mp3',
+        'audio/mp3' => 'mp3',
+        'audio/webm' => 'webm',
+        'audio/mp4' => 'm4a',
+    ];
+
+    foreach ($map as $type => $ext) {
+        if (stripos($contentType, $type) !== false) {
+            return $ext;
+        }
+    }
+
+    return $fallback;
+}
+
+function downloadRemoteFile($sourceUrl, $targetPath) {
+    $fh = fopen($targetPath, 'wb');
+    if (!$fh) {
+        return ['ok' => false, 'error' => 'Cannot create local file'];
+    }
+
+    $ch = curl_init($sourceUrl);
+    curl_setopt($ch, CURLOPT_FILE, $fh);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (compatible; YouTubeDownloader/1.0)');
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+
+    $ok = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE) ?: '';
+    $curlError = curl_error($ch);
+    curl_close($ch);
+    fclose($fh);
+
+    if (!$ok || $httpCode < 200 || $httpCode >= 300) {
+        if (file_exists($targetPath)) {
+            @unlink($targetPath);
+        }
+        return [
+            'ok' => false,
+            'error' => $curlError ?: ('HTTP ' . $httpCode),
+            'httpCode' => $httpCode,
+            'contentType' => $contentType,
+        ];
+    }
+
+    return [
+        'ok' => true,
+        'httpCode' => $httpCode,
+        'contentType' => $contentType,
+        'size' => filesize($targetPath),
+    ];
+}
+
+function requestCobalt(array $payload) {
+    $defaultEndpoint = 'https://api.cobalt.tools/api/json';
+    $configured = getenv('COBALT_API_URL');
+
+    $endpoints = [];
+    if ($configured) {
+        $endpoints[] = $configured;
+    }
+    $endpoints[] = $defaultEndpoint;
+
+    $lastAttempt = [
+        'httpCode' => 0,
+        'curlError' => '',
+        'raw' => '',
+        'endpoint' => $defaultEndpoint
+    ];
+
+    foreach ($endpoints as $endpoint) {
+        $ch = curl_init($endpoint);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'User-Agent: Mozilla/5.0 (compatible; YouTubeDownloader/1.0; +https://example.com)'
+        ]);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+
+        $raw = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE) ?: '';
+        $curlError = curl_error($ch);
+        curl_close($ch);
+
+        $lastAttempt = [
+            'httpCode' => $httpCode,
+            'curlError' => $curlError,
+            'raw' => $raw ?: '',
+            'endpoint' => $endpoint,
+            'contentType' => $contentType,
+        ];
+
+        if ($httpCode >= 200 && $httpCode < 300 && $raw) {
+            $decoded = json_decode($raw, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return [
+                    'ok' => true,
+                    'data' => $decoded,
+                    'meta' => $lastAttempt,
+                ];
+            }
+        }
+    }
+
+    return [
+        'ok' => false,
+        'meta' => $lastAttempt,
+    ];
 }
 
 if ($action === 'videoinfo') {
@@ -107,16 +244,6 @@ if ($action === 'download') {
 
     $isAudio = ($itag === 'audio');
 
-    // Use Cobalt API for downloading
-    $ch = curl_init('https://api.cobalt.tools/api/json');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // For local/older environments
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Content-Type: application/json',
-        'Accept: application/json'
-    ]);
-    
     $payload = [
         'url' => $url,
         'vQuality' => '1080',
@@ -128,25 +255,54 @@ if ($action === 'download') {
         $payload['isAudioOnly'] = true;
     }
 
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+    $cobaltResponse = requestCobalt($payload);
+    $res = $cobaltResponse['meta']['raw'] ?? '';
+    $httpCode = $cobaltResponse['meta']['httpCode'] ?? 0;
+    $curlError = $cobaltResponse['meta']['curlError'] ?? '';
+    $endpoint = $cobaltResponse['meta']['endpoint'] ?? 'https://api.cobalt.tools/api/json';
+    $contentType = $cobaltResponse['meta']['contentType'] ?? '';
     
-    $res = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_error($ch);
-    curl_close($ch);
-    
-    if ($httpCode >= 200 && $httpCode < 300 && $res) {
-        $result = json_decode($res, true);
+    if ($cobaltResponse['ok']) {
+        $result = $cobaltResponse['data'];
         if (isset($result['url'])) {
-            header('Location: ' . $result['url']);
-            exit;
+            $directUrl = $result['url'];
+            $safeTitle = sanitizeFileName($title ?: 'video');
+            $fallbackExt = $isAudio ? 'mp3' : 'mp4';
+            $provisionalPath = $downloadsDir . '/' . $safeTitle . '-' . $videoId . '.' . $fallbackExt;
+
+            $downloadResult = downloadRemoteFile($directUrl, $provisionalPath);
+            if (!$downloadResult['ok']) {
+                die('Failed to store file in downloads folder: ' . htmlspecialchars($downloadResult['error']));
+            }
+
+            $realExt = guessExtensionFromContentType($downloadResult['contentType'] ?? '', $fallbackExt);
+            $finalPath = $downloadsDir . '/' . $safeTitle . '-' . $videoId . '.' . $realExt;
+            if ($finalPath !== $provisionalPath) {
+                @rename($provisionalPath, $finalPath);
+            }
+
+            if (file_exists($finalPath)) {
+                header('Content-Description: File Transfer');
+                header('Content-Type: application/octet-stream');
+                header('Content-Disposition: attachment; filename="' . basename($finalPath) . '"');
+                header('Content-Length: ' . filesize($finalPath));
+                readfile($finalPath);
+                exit;
+            }
+
+            die('File downloaded but could not be served.');
         } elseif (isset($result['text'])) {
              die("Cobalt Error: " . $result['text']);
         }
     }
     
     $msg = "Failed to retrieve download link.<br>";
+    $msg .= "Endpoint: " . htmlspecialchars($endpoint) . "<br>";
     if ($curlError) $msg .= "CURL Error: " . $curlError . "<br>";
+    if ($contentType && stripos($contentType, 'text/html') !== false) {
+        $msg .= "The API returned HTML instead of JSON (often Cloudflare/WAF protection). "
+              . "Set COBALT_API_URL to your own Cobalt instance or another reachable mirror.<br>";
+    }
     if ($res) {
         $errorData = json_decode($res, true);
         if (isset($errorData['text'])) $msg .= "API Error: " . $errorData['text'];
