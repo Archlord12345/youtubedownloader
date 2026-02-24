@@ -91,12 +91,84 @@ function sanitizeFileName($name) {
     return $clean !== '' ? $clean : 'video';
 }
 
-function runYtDlpDownload($url, $outputTemplate, $isAudio) {
+
+function normalizeYouTubeUrl($url) {
+    $url = trim((string) $url);
+    if ($url === '') {
+        return '';
+    }
+
+    $parts = @parse_url($url);
+    if (!is_array($parts)) {
+        return $url;
+    }
+
+    $host = strtolower($parts['host'] ?? '');
+    $path = $parts['path'] ?? '';
+    $query = [];
+    if (!empty($parts['query'])) {
+        parse_str($parts['query'], $query);
+    }
+
+    $videoId = '';
+    if (strpos($host, 'youtu.be') !== false) {
+        $videoId = trim($path, '/');
+    } elseif (strpos($host, 'youtube.com') !== false) {
+        if (!empty($query['v'])) {
+            $videoId = (string) $query['v'];
+        } elseif (preg_match('#/(?:embed|shorts)/([a-zA-Z0-9_-]{11})#', $path, $m)) {
+            $videoId = $m[1];
+        }
+    }
+
+    if (preg_match('/^[a-zA-Z0-9_-]{11}$/', $videoId)) {
+        return 'https://www.youtube.com/watch?v=' . $videoId;
+    }
+
+    return $url;
+}
+
+function getYtDlpBinary() {
     $binary = trim((string) shell_exec('command -v yt-dlp 2>/dev/null'));
+    if ($binary !== '') {
+        return $binary;
+    }
+
+    $legacy = trim((string) shell_exec('command -v youtube-dl 2>/dev/null'));
+    return $legacy;
+}
+
+function fetchVideoInfoWithYtDlp($url) {
+    $binary = getYtDlpBinary();
+    if ($binary === '') {
+        return null;
+    }
+
+    $cmd = implode(' ', [
+        escapeshellarg($binary),
+        '--dump-single-json',
+        '--no-playlist',
+        '--playlist-items', '1',
+        '--skip-download',
+        escapeshellarg($url),
+        '2>/dev/null',
+    ]);
+
+    $raw = shell_exec($cmd);
+    if (!$raw) {
+        return null;
+    }
+
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : null;
+}
+
+function runYtDlpDownload($url, $outputTemplate, $isAudio) {
+    $binary = getYtDlpBinary();
     if ($binary === '') {
         return [
             'ok' => false,
-            'error' => "yt-dlp is not installed on the server. Install it (e.g. apt install yt-dlp) and retry.",
+            'error' => "Neither yt-dlp nor youtube-dl is installed on the server. Install yt-dlp and retry.",
         ];
     }
 
@@ -162,7 +234,7 @@ function runYtDlpDownload($url, $outputTemplate, $isAudio) {
 
 if ($action === 'videoinfo') {
     header('Content-Type: application/json');
-    $url = $_GET['url'] ?? '';
+    $url = normalizeYouTubeUrl($_GET['url'] ?? '');
     if (!$url) {
         echo json_encode(['error' => 'URL is required']);
         exit;
@@ -172,20 +244,18 @@ if ($action === 'videoinfo') {
     preg_match('/(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/', $url, $matches);
     $videoId = $matches[1] ?? uniqid();
 
-    // Fast fetching of title and thumbnail using Noembed
-    $noembedUrl = 'https://noembed.com/embed?url=' . urlencode($url);
-    $res = @file_get_contents($noembedUrl);
-    if ($res) {
-        $noembedData = json_decode($res, true);
-        $title = $noembedData['title'] ?? 'YouTube Video';
-        $thumbnail = $noembedData['thumbnail_url'] ?? "https://img.youtube.com/vi/$videoId/hqdefault.jpg";
+    // Fetch title/thumbnail using local downloader metadata (no Cobalt API).
+    $info = fetchVideoInfoWithYtDlp($url);
+    if (is_array($info)) {
+        $videoId = $info['id'] ?? $videoId;
+        $title = $info['title'] ?? 'YouTube Video';
+        $thumbnail = $info['thumbnail'] ?? "https://img.youtube.com/vi/$videoId/hqdefault.jpg";
     } else {
         $title = 'YouTube Video';
         $thumbnail = "https://img.youtube.com/vi/$videoId/hqdefault.jpg";
     }
 
-    // Provide generic formats for Cobalt downloader
-    // Cobalt handles the direct extraction when we actually request the download
+    // Static formats exposed by this app. Actual media retrieval is done by yt-dlp.
     $formats = [
         [
             'itag' => 'max',
@@ -210,7 +280,7 @@ if ($action === 'videoinfo') {
 }
 
 if ($action === 'download') {
-    $url = $_GET['url'] ?? '';
+    $url = normalizeYouTubeUrl($_GET['url'] ?? '');
     $itag = $_GET['itag'] ?? 'max';
     $title = $_GET['title'] ?? 'video';
     $thumbnail = $_GET['thumbnail'] ?? '';
